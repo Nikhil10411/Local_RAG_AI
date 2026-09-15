@@ -1,0 +1,44 @@
+﻿# Virtual Environments & Python Packages
+.venv/
+venv/
+**/site-packages/**
+__pycache__/
+*.py[cod]
+
+# Local LLM Models & Weights (Blocks GitHub push failure)
+*.gguf
+*.bin
+llama-3-8b-instruct.Q4_K_M.gguf
+models/
+Modelfile.txt
+
+# Databases & Vector Store
+data/
+backend/data/
+chroma_db/
+backend/chroma_db/
+**/chroma_db/**
+agent_memory.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Document Exports & Temporary Files
+exports/
+backend/exports/
+*.docx
+*.pdf
+*.pptx
+*.xlsx
+*.csv
+
+# Node & Frontend Build Output
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.env
+.DS_Store
+Thumbs.db
+.vscode/
