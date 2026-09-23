@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { atomDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { sendMessage, submitFeedback } from "./services/api";
+import { streamMessage, submitFeedback } from "./services/api";
 import "./App.css";
 
 export default function App() {
@@ -25,6 +25,10 @@ export default function App() {
   const [convertedFileName, setConvertedFileName] = useState(null);
   const [isConverting, setIsConverting] = useState(false);
 
+  // New Generation Controls
+  const [engineMode, setEngineMode] = useState("hybrid"); // 'chroma_only' | 'hybrid' | 'model_only'
+  const [detailLevel, setDetailLevel] = useState("detailed"); // 'short' | 'detailed' | 'full'
+
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
@@ -42,7 +46,6 @@ export default function App() {
     setTimeout(() => setToast(null), 3500);
   };
 
-  // Poll database storage, latency, and accuracy metrics
   const fetchStats = async () => {
     try {
       const res = await fetch("http://localhost:8000/api/system/stats");
@@ -61,7 +64,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Dynamic textarea height management
   const handleInputChange = (e) => {
     setInput(e.target.value);
     if (textareaRef.current) {
@@ -80,32 +82,62 @@ export default function App() {
       textareaRef.current.style.height = "auto";
     }
 
-    setMessages((prev) => [...prev, { role: "user", content: userText }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: userText },
+      {
+        role: "assistant",
+        content: "",
+        id: null,
+        accuracy: undefined,
+        grounding: undefined,
+        tokenSpeed: undefined,
+        modeUsed: engineMode,
+        depthUsed: detailLevel,
+      },
+    ]);
     setLoading(true);
 
     try {
-      const data = await sendMessage(userText);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: data.response,
-          id: data.message_id,
-          accuracy: data.retrieval_accuracy,
-          grounding: data.grounding_score,
+      await streamMessage(
+        userText,
+        (currentText) => {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastMsg = updated[updated.length - 1];
+            if (lastMsg && lastMsg.role === "assistant") {
+              lastMsg.content = currentText;
+            }
+            return updated;
+          });
         },
-      ]);
-      fetchStats();
+        (metadata) => {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastMsg = updated[updated.length - 1];
+            if (lastMsg && lastMsg.role === "assistant") {
+              lastMsg.id = metadata.message_id;
+              lastMsg.accuracy = metadata.retrieval_accuracy;
+              lastMsg.grounding = metadata.grounding_score;
+              lastMsg.tokenSpeed = metadata.tokens_per_second;
+            }
+            return updated;
+          });
+          fetchStats();
+        },
+        engineMode,
+        detailLevel
+      );
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            "⚠️ Unable to reach the local backend. Please verify that Ollama and FastAPI are running.",
-          id: null,
-        },
-      ]);
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastMsg = updated[updated.length - 1];
+        if (lastMsg && lastMsg.role === "assistant") {
+          lastMsg.content =
+            "⚠️ Unable to reach the local backend. Please verify that Ollama and FastAPI are running.";
+        }
+        return updated;
+      });
     } finally {
       setLoading(false);
     }
@@ -136,7 +168,6 @@ export default function App() {
     showToast("📋 Code copied to clipboard!");
   };
 
-  // Multi-format ingestion with OCR
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -161,7 +192,6 @@ export default function App() {
     }
   };
 
-  // Automated instant file downloader
   const triggerBrowserDownload = (downloadUrl, fileName) => {
     const anchor = document.createElement("a");
     anchor.href = downloadUrl;
@@ -171,7 +201,6 @@ export default function App() {
     document.body.removeChild(anchor);
   };
 
-  // Document transformation engine with immediate file extraction
   const handleConvertSubmit = async (e) => {
     e.preventDefault();
     if (!convertFile) {
@@ -196,7 +225,6 @@ export default function App() {
       setConvertedUrl(data.download_url);
       setConvertedFileName(data.converted_file);
 
-      // Instantly push the converted file to user's browser download bar
       triggerBrowserDownload(data.download_url, data.converted_file);
       showToast(`🎉 Converted to ${data.converted_file}! Starting download...`);
       fetchStats();
@@ -211,7 +239,6 @@ export default function App() {
     <div className="app-shell">
       {toast && <div className="toast">{toast}</div>}
 
-      {/* Hidden File Input for Unified File Ingestion */}
       <input
         type="file"
         ref={fileInputRef}
@@ -411,7 +438,7 @@ export default function App() {
                       cursor: "pointer",
                       padding: 0,
                       textDecoration: "underline",
-                      font: "inherit"
+                      font: "inherit",
                     }}
                   >
                     ⬇️ Download File Again
@@ -439,7 +466,7 @@ export default function App() {
                 </div>
                 <div className="message-content">
                   <div className="message-name">
-                    {m.role === "assistant" ? "ENGINEERING AGENT" : "YOU"}
+                    {m.role === "assistant" ? "ENGINEERING AGENT" : "USER"}
                   </div>
                   <div className="message-bubble">
                     <ReactMarkdown
@@ -479,25 +506,39 @@ export default function App() {
                     </ReactMarkdown>
                   </div>
 
-                  {m.role === "assistant" && m.id && (
+                  {m.role === "assistant" && (
                     <div className="message-tools">
-                      <button
-                        type="button"
-                        title="Helpful"
-                        onClick={() => handleFeedback(m.id, 1)}
-                      >
-                        👍
-                      </button>
-                      <button
-                        type="button"
-                        title="Calibrate"
-                        onClick={() => handleFeedback(m.id, -1)}
-                      >
-                        👎
-                      </button>
+                      {m.id && (
+                        <>
+                          <button
+                            type="button"
+                            title="Helpful"
+                            onClick={() => handleFeedback(m.id, 1)}
+                          >
+                            👍
+                          </button>
+                          <button
+                            type="button"
+                            title="Calibrate"
+                            onClick={() => handleFeedback(m.id, -1)}
+                          >
+                            👎
+                          </button>
+                        </>
+                      )}
                       {m.accuracy !== undefined && (
                         <span className="quality-tag">
                           Sim: {m.accuracy}% · Ground: {m.grounding}%
+                        </span>
+                      )}
+                      {m.tokenSpeed !== undefined && (
+                        <span className="quality-tag">
+                          ⚡ {m.tokenSpeed} tok/s
+                        </span>
+                      )}
+                      {m.modeUsed && (
+                        <span className="mode-pill-tag">
+                          {m.modeUsed === "chroma_only" ? "Docs" : m.modeUsed === "hybrid" ? "Hybrid" : "Model"}
                         </span>
                       )}
                     </div>
@@ -506,13 +547,19 @@ export default function App() {
               </div>
             ))}
 
-            {loading && (
+            {loading && messages[messages.length - 1]?.content === "" && (
               <div className="message-row assistant">
                 <div className="message-avatar ai">⚡</div>
                 <div className="message-content">
                   <div className="message-name">ENGINEERING AGENT</div>
                   <div className="typing-message">
-                    <span>Evaluating local context on CPU</span>
+                    <span>
+                      {engineMode === "chroma_only"
+                        ? "Querying vector index & assembling documents..."
+                        : engineMode === "model_only"
+                        ? "Generating parametric response on local CPU..."
+                        : "Evaluating hybrid context and local memory..."}
+                    </span>
                     <div className="typing-dots">
                       <span></span>
                       <span></span>
@@ -526,38 +573,109 @@ export default function App() {
           </div>
         </section>
 
-        {/* Fixed Bottom Composer Area */}
+        {/* Fixed Bottom Composer Area with Mode & Depth Bar */}
         <footer className="composer-area">
-          <form onSubmit={handleSend} className="composer">
-            <button
-              type="button"
-              className="attach-button"
-              title="Ingest File (PDF, Office, Images with OCR)"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              📎
-            </button>
-            <textarea
-              ref={textareaRef}
-              rows={1}
-              value={input}
-              onChange={handleInputChange}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask a technical question, query your documents, or trigger tasks..."
-              disabled={loading}
-            />
-            <button
-              type="submit"
-              className="send-button"
-              disabled={loading || !input.trim()}
-              title="Send Message"
-            >
-              ↑
-            </button>
-          </form>
+          <div className="composer-wrapper">
+            {/* Quick Engine & Depth Bar */}
+            <div className="controls-bar">
+              <div className="control-group">
+                <span className="control-label">SOURCE</span>
+                <div className="pill-selector">
+                  <button
+                    type="button"
+                    className={`pill-btn ${engineMode === "chroma_only" ? "active" : ""}`}
+                    onClick={() => setEngineMode("chroma_only")}
+                    title="Strict Document RAG (Zero Hallucination)"
+                  >
+                    Docs Only
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${engineMode === "hybrid" ? "active" : ""}`}
+                    onClick={() => setEngineMode("hybrid")}
+                    title="Context Grounded with General AI Fallback"
+                  >
+                    Hybrid
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${engineMode === "model_only" ? "active" : ""}`}
+                    onClick={() => setEngineMode("model_only")}
+                    title="Direct Llama 3 Parametric Generation"
+                  >
+                    Model Only
+                  </button>
+                </div>
+              </div>
+
+              <div className="control-group">
+                <span className="control-label">DEPTH</span>
+                <div className="pill-selector">
+                  <button
+                    type="button"
+                    className={`pill-btn ${detailLevel === "short" ? "active-green" : ""}`}
+                    onClick={() => setDetailLevel("short")}
+                    title="Fast 2-4 sentence summary"
+                  >
+                    Short
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${detailLevel === "detailed" ? "active-green" : ""}`}
+                    onClick={() => setDetailLevel("detailed")}
+                    title="Structured technical breakdown"
+                  >
+                    Detailed
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${detailLevel === "full" ? "active-green" : ""}`}
+                    onClick={() => setDetailLevel("full")}
+                    title="Complete sequenced document extraction / exhaustive response"
+                  >
+                    Full Audit
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <form onSubmit={handleSend} className="composer">
+              <button
+                type="button"
+                className="attach-button"
+                title="Ingest File (PDF, Office, Images with OCR)"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                📎
+              </button>
+              <textarea
+                ref={textareaRef}
+                rows={1}
+                value={input}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  engineMode === "chroma_only"
+                    ? "Strictly query indexed documents..."
+                    : engineMode === "model_only"
+                    ? "Query Llama 3 internal weights directly..."
+                    : "Ask a technical question, query your documents, or trigger tasks..."
+                }
+                disabled={loading}
+              />
+              <button
+                type="submit"
+                className="send-button"
+                disabled={loading || !input.trim()}
+                title="Send Message"
+              >
+                ↑
+              </button>
+            </form>
+          </div>
           <div className="composer-hint">
             <span>
-              Enter to send · Shift + Enter for new line · Drag or attach files for instant OCR ingestion
+              Enter to send · Shift + Enter for new line · Mode: <strong>{engineMode.toUpperCase()}</strong> · Depth: <strong>{detailLevel.toUpperCase()}</strong>
             </span>
           </div>
         </footer>

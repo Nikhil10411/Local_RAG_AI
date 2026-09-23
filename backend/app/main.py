@@ -1,15 +1,19 @@
 import uuid
+import time
+import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from app.agent import AgentState, rag_app
+from app.agent import AgentState, EngineMode, OutputDepth, rag_app
 from app.config import settings
+from app.Normalization import get_logical_group_id
 from app.converters import (
     EXPORTS_DIR,
     convert_docx_to_pdf_exact,
@@ -21,7 +25,6 @@ from app.converters import (
     export_to_pptx,
     extract_content_from_file,
 )
-from starlette.concurrency import run_in_threadpool
 from app.memory import memory_manager
 from app.rag import rag_engine
 from app.system_stats import fetch_system_metrics
@@ -59,6 +62,8 @@ async def download_file(filename: str):
 class ChatRequest(BaseModel):
     user_id: str = "default_user"
     message: str
+    mode: Literal["chroma_only", "model_only", "hybrid"] = "hybrid"
+    detail_level: Literal["short", "detailed", "full"] = "detailed"
 
 
 class FeedbackRequest(BaseModel):
@@ -77,40 +82,6 @@ def system_stats() -> Dict[str, Any]:
     return fetch_system_metrics()
 
 
-@app.post("/api/chat")
-def chat_endpoint(req: ChatRequest) -> Dict[str, Any]:
-    try:
-        memory_manager.save_message(req.user_id, "user", req.message)
-
-        initial_state: AgentState = {
-            "user_id": req.user_id,
-            "input": req.message,
-            "history": [],
-            "profile": {},
-            "retrieved_docs": [],
-            "retrieval_accuracy": 0.0,
-            "grounding_score": 0.0,
-            "response": "",
-            "latency": 0.0,
-        }
-
-        result: Dict[str, Any] = rag_app.invoke(initial_state)
-        response_text = str(result.get("response", ""))
-        ai_message_id = memory_manager.save_message(
-            req.user_id, "assistant", response_text
-        )
-
-        return {
-            "response": response_text,
-            "message_id": ai_message_id,
-            "profile": result.get("profile", {}),
-            "retrieval_accuracy": result.get("retrieval_accuracy", 0.0),
-            "grounding_score": result.get("grounding_score", 0.0),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/feedback")
 def feedback_endpoint(req: FeedbackRequest) -> Dict[str, str]:
     memory_manager.record_feedback(req.message_id, req.feedback)
@@ -123,6 +94,7 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Filename is missing or invalid")
 
     original_filename = file.filename
+    logical_group = get_logical_group_id(original_filename)
     raw_content = await file.read()
 
     extracted_text = extract_content_from_file(original_filename, raw_content)
@@ -133,13 +105,21 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
             detail="Could not extract text. For images, verify Tesseract OCR is installed.",
         )
 
-    # 1. Purge stale chunks of this document from both vector store and lexical FTS
-    deleted_count = rag_engine.delete_file_documents(original_filename)
-    memory_manager.delete_document_chunks_fts(original_filename)
+    # 1. Version-Aware Purge: Remove stale chunks matching the logical group across both stores
+    deleted_chroma = 0
+    try:
+        logical_existing = rag_engine.collection.get(where={"logical_group": logical_group})
+        if logical_existing and logical_existing.get("ids"):
+            rag_engine.collection.delete(ids=logical_existing["ids"])
+            deleted_chroma = len(logical_existing["ids"])
+    except Exception:
+        pass
+
+    deleted_fts = memory_manager.delete_logical_group_chunks_fts(logical_group)
 
     # 2. Chunk text with safe overlap buffer
-    chunk_size = 1200
-    overlap = 150
+    chunk_size = 1500
+    overlap = 250
     chunks: list[str] = []
     start = 0
     text_length = len(extracted_text)
@@ -149,14 +129,17 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         chunks.append(extracted_text[start:end])
         start += chunk_size - overlap
 
-    # 3. Dual-Store Ingestion:
-    # A. Index into SQLite FTS5 for sub-millisecond lexical keyword retrieval
-    memory_manager.index_document_chunks_fts(original_filename, chunks)
+    # 3. Dual-Store Ingestion with Logical Mapping
+    memory_manager.index_document_chunks_fts(original_filename, logical_group, chunks)
 
-    # B. Batch embed and index into ChromaDB for semantic vector retrieval
-    doc_ids = [f"{original_filename}_chunk_{idx}" for idx in range(len(chunks))]
+    doc_ids = [f"{logical_group}_chunk_{idx}" for idx in range(len(chunks))]
     metadatas = [
-        {"filename": original_filename, "chunk_index": idx}
+        {
+            "filename": original_filename,
+            "logical_group": logical_group,
+            "chunk_index": idx,
+            "doc_id": logical_group,
+        }
         for idx in range(len(chunks))
     ]
 
@@ -166,10 +149,14 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         metadatas=metadatas,
     )
 
+    # 4. Reclaim disk space immediately by vacuuming SQLite storage
+    memory_manager.vacuum_database()
+
     return {
         "status": "success",
         "filename": original_filename,
-        "replaced_previous_chunks": deleted_count,
+        "logical_group": logical_group,
+        "replaced_previous_chunks": deleted_chroma + deleted_fts,
         "chunks_indexed": len(chunks),
         "fts_indexed": True,
         "preview": extracted_text[:200],
@@ -187,6 +174,7 @@ def delete_document_endpoint(filename: str) -> Dict[str, Any]:
         "chunks_removed": chroma_deleted,
         "fts_records_removed": fts_deleted,
     }
+
 
 @app.post("/api/convert")
 async def convert_document(
@@ -229,3 +217,62 @@ async def convert_document(
         "converted_file": generated_filename,
         "download_url": f"http://localhost:8000/api/download/{generated_filename}",
     }
+
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(req: ChatRequest):
+    try:
+        memory_manager.save_message(req.user_id, "user", req.message)
+
+        initial_state: AgentState = {
+            "user_id": req.user_id,
+            "input": req.message,
+            "mode": req.mode,
+            "detail_level": req.detail_level,
+            "history": [],
+            "profile": {},
+            "retrieved_docs": [],
+            "retrieval_accuracy": 0.0,
+            "grounding_score": 0.0,
+            "response": "",
+            "latency": 0.0,
+        }
+
+        async def event_generator():
+            full_response = ""
+            start_time = time.time()
+
+            result = await run_in_threadpool(rag_app.invoke, initial_state)
+            response_text = str(result.get("response", ""))
+
+            # Simulate streaming words/tokens smoothly to the client
+            words = response_text.split(" ")
+            for i, word in enumerate(words):
+                token = word + (" " if i < len(words) - 1 else "")
+                full_response += token
+                yield f"data: {json.dumps({'token': token})}\n\n"
+
+            elapsed_time = time.time() - start_time
+            total_tokens = len(full_response.split())
+            tokens_per_sec = round(total_tokens / max(elapsed_time, 0.1), 1)
+
+            # Save final message to history after streaming finishes
+            ai_message_id = memory_manager.save_message(
+                req.user_id, "assistant", full_response
+            )
+
+            # Send final metadata payload including token speed
+            metadata = {
+                "done": True,
+                "message_id": ai_message_id,
+                "profile": result.get("profile", {}),
+                "retrieval_accuracy": result.get("retrieval_accuracy", 0.0),
+                "grounding_score": result.get("grounding_score", 0.0),
+                "tokens_per_second": tokens_per_sec,
+            }
+            yield f"data: {json.dumps(metadata)}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -11,14 +11,12 @@ from app.config import settings
 class MemoryManager:
     def __init__(self) -> None:
         self.db_path = settings.DATABASE_PATH
-        # Automatically create the parent directory if it does not exist yet
         Path(self.db_path).resolve().parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._init_fts()
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
-        # Enable Write-Ahead Logging (WAL) for rapid concurrent reading/writing
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         return conn
@@ -26,7 +24,6 @@ class MemoryManager:
     def _init_db(self) -> None:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Episodic Memory (Raw chat interactions)
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -39,7 +36,6 @@ class MemoryManager:
                 )
                 """
             )
-            # 2. Semantic User Identity (Persistent facts, preferences, and learned rules)
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_identity (
@@ -49,7 +45,6 @@ class MemoryManager:
                 )
                 """
             )
-            # 3. Telemetry & RAG Performance Metrics
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rag_metrics (
@@ -67,7 +62,7 @@ class MemoryManager:
             conn.commit()
 
     def _init_fts(self) -> None:
-        """Initializes SQLite Full-Text Search 5 (FTS5) for sub-millisecond lexical chunk retrieval."""
+        """Initializes FTS5 with group tracking for precise multi-file indexing and retrieval."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -75,6 +70,7 @@ class MemoryManager:
                 CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(
                     doc_id UNINDEXED,
                     filename UNINDEXED,
+                    logical_group UNINDEXED,
                     chunk_index UNINDEXED,
                     content,
                     tokenize = 'porter unicode61'
@@ -82,8 +78,6 @@ class MemoryManager:
                 """
             )
             conn.commit()
-
-    # ----------------- CHAT & FEEDBACK MEMORY -----------------
 
     def save_message(self, user_id: str, role: str, content: str) -> int:
         with self._get_connection() as conn:
@@ -113,8 +107,6 @@ class MemoryManager:
             )
             rows = cursor.fetchall()
             return [{"role": str(r[0]), "content": str(r[1])} for r in reversed(rows)]
-
-    # ----------------- USER PROFILE & LEARNED CONSTRAINTS -----------------
 
     def get_user_identity(self, user_id: str) -> Dict[str, Any]:
         with self._get_connection() as conn:
@@ -163,64 +155,79 @@ class MemoryManager:
             conn.commit()
             return cursor.lastrowid or 0
 
-    # ----------------- SQLITE FTS5 LEXICAL SEARCH & STORAGE -----------------
-
-    def index_document_chunks_fts(self, filename: str, chunks: List[str]) -> int:
-        """
-        Idempotently inserts or updates document chunks in the FTS5 virtual table.
-        Purges prior chunks associated with the filename to prevent stale results.
-        """
+    def index_document_chunks_fts(self, filename: str, logical_group: str, chunks: List[str]) -> int:
+        """Atomically indexes chunks linked to filename, logical group, and 0-based chunk indices."""
         if not chunks:
             return 0
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Clean out previous chunks of the same file
-            cursor.execute("DELETE FROM document_fts WHERE filename = ?", (filename,))
+            cursor.execute("DELETE FROM document_fts WHERE logical_group = ?", (logical_group,))
 
-            # 2. Insert new chunks in batch
             records = [
-                (f"{filename}_chunk_{idx}", filename, idx, chunk)
+                (f"{logical_group}_chunk_{idx}", filename, logical_group, idx, chunk)
                 for idx, chunk in enumerate(chunks)
             ]
             cursor.executemany(
-                "INSERT INTO document_fts (doc_id, filename, chunk_index, content) VALUES (?, ?, ?, ?)",
+                "INSERT INTO document_fts (doc_id, filename, logical_group, chunk_index, content) VALUES (?, ?, ?, ?, ?)",
                 records,
             )
             conn.commit()
             return len(records)
 
     def delete_document_chunks_fts(self, filename: str) -> int:
-        """Removes all FTS5 indexed chunks for a deleted file."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM document_fts WHERE filename = ?", (filename,))
             conn.commit()
             return cursor.rowcount
 
-    def search_fts(self, query: str, limit: int = 4) -> List[Dict[str, Any]]:
-        """
-        Performs high-speed BM25 ranked lexical retrieval using FTS5.
-        Bypasses CPU vector generation completely for exact keyword matches.
-        """
-        # Strip special characters and filter short tokens (< 3 characters)
-        raw_tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", query)
+    def delete_logical_group_chunks_fts(self, logical_group: str) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM document_fts WHERE logical_group = ?", (logical_group,))
+            conn.commit()
+            return cursor.rowcount
 
-        # Ignore conversational stop words to prevent false lexical hits
+    def get_full_document_ordered(self, doc_identifier: str = "") -> str:
+        """
+        Reconstructs documents sequentially from chunk 0 upwards.
+        Matches by logical group, filename, or partial name match.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            clean_ident = f"%{doc_identifier.strip()}%" if doc_identifier else "%"
+            cursor.execute(
+                """
+                SELECT content FROM document_fts
+                WHERE logical_group LIKE ? OR filename LIKE ? OR doc_id LIKE ?
+                ORDER BY CAST(chunk_index AS INTEGER) ASC
+                """,
+                (clean_ident, clean_ident, clean_ident),
+            )
+            rows = cursor.fetchall()
+            if rows:
+                return "\n\n".join(str(r[0]) for r in rows)
+            return ""
+
+    def vacuum_database(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute("VACUUM;")
+
+    def search_fts(self, query: str, limit: int = 4) -> List[Dict[str, Any]]:
+        raw_tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", query)
         stop_words = {
             "what", "where", "when", "which", "who", "whom", "this", "that",
             "these", "those", "have", "from", "with", "about", "your", "tell",
-            "give", "show", "current", "latest", "please", "does", "will"
+            "give", "show", "current", "latest", "please", "does", "will", "find"
         }
         search_terms = [t for t in raw_tokens if t.lower() not in stop_words]
-
         if not search_terms:
             return []
 
-        # Prepare formatted query for FTS5: "token1" OR "token2" OR ...
         fts_match_query = " OR ".join([f'"{term}"' for term in search_terms])
-
         results: List[Dict[str, Any]] = []
+
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -246,7 +253,6 @@ class MemoryManager:
                         "score": abs(float(rank)),
                     })
         except sqlite3.OperationalError:
-            # Safe fallback if syntax parsing encounters irregular characters
             return []
 
         return results
