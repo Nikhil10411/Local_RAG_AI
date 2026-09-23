@@ -107,3 +107,6 @@ A high-performance, fully air-gapped, privacy-first AI engineering workspace. De
                                                               │   Local Ollama Engine       │
                                                               │  (Llama-3-8B Q4_K_M on CPU) │
                                                               └─────────────────────────────┘
+## 🏗️ System Architecture
+
+![Local AI Agent Architecture](docs/architecture-diagram.jpg)
